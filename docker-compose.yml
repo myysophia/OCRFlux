@@ -1,0 +1,197 @@
+# OCRFlux API Service - Docker Compose Configuration
+version: '3.8'
+
+services:
+  # Main OCRFlux API Service
+  ocrflux-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    image: ocrflux-api:latest
+    container_name: ocrflux-api
+    restart: unless-stopped
+    ports:
+      - "${OCRFLUX_PORT:-8000}:8000"
+    environment:
+      # Application Configuration
+      - APP_NAME=OCRFlux API Service
+      - APP_VERSION=1.0.0
+      - DEBUG=${DEBUG:-false}
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      
+      # Server Configuration
+      - HOST=0.0.0.0
+      - PORT=8000
+      - WORKERS=${WORKERS:-2}
+      
+      # Model Configuration
+      - MODEL_PATH=${MODEL_PATH:-/app/models/OCRFlux-3B}
+      - GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.8}
+      - MODEL_MAX_CONTEXT=${MODEL_MAX_CONTEXT:-8192}
+      
+      # File Processing Configuration
+      - MAX_FILE_SIZE=${MAX_FILE_SIZE:-104857600}  # 100MB
+      - TEMP_DIR=/app/tmp
+      - ALLOWED_EXTENSIONS=.pdf,.png,.jpg,.jpeg
+      
+      # Task Queue Configuration
+      - MAX_CONCURRENT_TASKS=${MAX_CONCURRENT_TASKS:-4}
+      - TASK_TIMEOUT=${TASK_TIMEOUT:-300}
+      - RESULT_CACHE_TTL=${RESULT_CACHE_TTL:-3600}
+      
+      # Security Configuration
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000,http://localhost:8080}
+      - ENABLE_RATE_LIMITING=${ENABLE_RATE_LIMITING:-true}
+      - RATE_LIMIT_PER_MINUTE=${RATE_LIMIT_PER_MINUTE:-60}
+      - RATE_LIMIT_PER_HOUR=${RATE_LIMIT_PER_HOUR:-1000}
+      
+      # Logging Configuration
+      - LOG_FILE=/app/logs/ocrflux.log
+    volumes:
+      # Persistent storage for logs
+      - ocrflux-logs:/app/logs
+      # Temporary files (can be tmpfs for better performance)
+      - ocrflux-tmp:/app/tmp
+      # Model storage (mount your model directory here)
+      - ${MODEL_VOLUME_PATH:-ocrflux-models}:/app/models
+      # Optional: Custom configuration
+      - ${CONFIG_PATH:-./config}:/app/config:ro
+    networks:
+      - ocrflux-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: ${MEMORY_LIMIT:-4G}
+          cpus: '${CPU_LIMIT:-2.0}'
+        reservations:
+          memory: ${MEMORY_RESERVATION:-2G}
+          cpus: '${CPU_RESERVATION:-1.0}'
+    # GPU support (uncomment if using GPU)
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  # Redis for caching (optional)
+  redis:
+    image: redis:7-alpine
+    container_name: ocrflux-redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - ocrflux-redis-data:/data
+    networks:
+      - ocrflux-network
+    command: redis-server --appendonly yes --maxmemory ${REDIS_MAX_MEMORY:-256mb} --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    profiles:
+      - with-redis
+
+  # Nginx reverse proxy (optional)
+  nginx:
+    image: nginx:alpine
+    container_name: ocrflux-nginx
+    restart: unless-stopped
+    ports:
+      - "${NGINX_HTTP_PORT:-80}:80"
+      - "${NGINX_HTTPS_PORT:-443}:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ocrflux-nginx-logs:/var/log/nginx
+      # SSL certificates (if using HTTPS)
+      - ${SSL_CERT_PATH:-./ssl}:/etc/nginx/ssl:ro
+    networks:
+      - ocrflux-network
+    depends_on:
+      - ocrflux-api
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    profiles:
+      - with-nginx
+
+  # Monitoring with Prometheus (optional)
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: ocrflux-prometheus
+    restart: unless-stopped
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ocrflux-prometheus-data:/prometheus
+    networks:
+      - ocrflux-network
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    profiles:
+      - with-monitoring
+
+  # Grafana for visualization (optional)
+  grafana:
+    image: grafana/grafana:latest
+    container_name: ocrflux-grafana
+    restart: unless-stopped
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ocrflux-grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    networks:
+      - ocrflux-network
+    depends_on:
+      - prometheus
+    profiles:
+      - with-monitoring
+
+# Named volumes for persistent data
+volumes:
+  ocrflux-logs:
+    driver: local
+  ocrflux-tmp:
+    driver: local
+  ocrflux-models:
+    driver: local
+  ocrflux-redis-data:
+    driver: local
+  ocrflux-nginx-logs:
+    driver: local
+  ocrflux-prometheus-data:
+    driver: local
+  ocrflux-grafana-data:
+    driver: local
+
+# Networks
+networks:
+  ocrflux-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
