@@ -51,6 +51,57 @@ config = SimpleConfig()
 # Simple task storage (in-memory for demo)
 tasks = {}
 
+# Fast background processing function (includes file upload)
+async def process_file_upload_and_ocr(task_id: str, file: UploadFile, options: dict):
+    """Background function that handles both file upload and OCR processing"""
+    file_path = None
+    try:
+        # Update task status
+        tasks[task_id]["status"] = "uploading"
+        tasks[task_id]["progress"] = 0.05
+        tasks[task_id]["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        
+        logger.info(f"Starting file upload for task {task_id}: {file.filename}")
+        
+        # Check file size limit
+        if file.size and file.size > config.max_file_size:
+            raise Exception(f"File size {file.size} bytes exceeds maximum limit of {config.max_file_size} bytes")
+        
+        # Save uploaded file to temporary location
+        file_extension = Path(file.filename).suffix.lower()
+        with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension, dir=config.temp_dir) as temp_file:
+            content = await file.read()
+            temp_file.write(content)
+            file_path = temp_file.name
+        
+        # Update task with actual file size
+        actual_file_size = len(content)
+        tasks[task_id]["file_size"] = actual_file_size
+        tasks[task_id]["status"] = "processing"
+        tasks[task_id]["progress"] = 0.1
+        tasks[task_id]["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        
+        logger.info(f"File uploaded for task {task_id}: {file.filename} ({actual_file_size} bytes)")
+        
+        # Now do OCR processing
+        await process_ocr_background(task_id, file_path, file.filename, actual_file_size, options)
+        
+    except Exception as e:
+        logger.error(f"File upload/processing failed for task {task_id}: {e}")
+        
+        # Update task with error
+        tasks[task_id]["status"] = "failed"
+        tasks[task_id]["progress"] = 1.0
+        tasks[task_id]["error_message"] = str(e)
+        tasks[task_id]["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        
+        # Clean up file if it was created
+        if file_path and os.path.exists(file_path):
+            try:
+                os.unlink(file_path)
+            except:
+                pass
+
 # Background OCR processing function
 async def process_ocr_background(task_id: str, file_path: str, file_name: str, file_size: int, options: dict):
     """Background OCR processing function"""
@@ -453,7 +504,7 @@ async def parse_file(
             except Exception as e:
                 logger.warning(f"Failed to clean up temp file {temp_file_path}: {e}")
 
-# Async single file processing
+# Fast async file processing (optimized for Cloudflare Tunnel)
 @app.post("/api/v1/parse-async", tags=["OCR Processing"])
 async def parse_file_async(
     background_tasks: BackgroundTasks,
@@ -462,16 +513,16 @@ async def parse_file_async(
     max_page_retries: int = Form(1, description="Maximum retry attempts per page")
 ):
     """
-    Submit a single file for asynchronous OCR processing
+    Submit a single file for asynchronous OCR processing (Optimized for Cloudflare Tunnel)
     
-    This endpoint immediately returns a task ID and processes the file in the background.
-    Use this for large files or when you want to avoid timeout issues with proxies like Cloudflare.
+    This endpoint is optimized to respond as quickly as possible to avoid proxy timeouts.
+    The file is processed entirely in the background.
     
-    Returns a task ID that can be used to check processing status and retrieve results.
+    Returns a task ID immediately that can be used to check processing status and retrieve results.
     """
     import uuid
     
-    # Validate file type
+    # Quick validation without reading the full file
     allowed_extensions = {'.pdf', '.png', '.jpg', '.jpeg'}
     file_extension = Path(file.filename).suffix.lower()
     
@@ -481,70 +532,110 @@ async def parse_file_async(
             detail=f"File type {file_extension} not supported. Allowed types: {', '.join(allowed_extensions)}"
         )
     
-    # Check file size
-    if file.size and file.size > config.max_file_size:
-        raise HTTPException(
-            status_code=413,
-            detail=f"File size {file.size} bytes exceeds maximum limit of {config.max_file_size} bytes"
-        )
+    # Generate task ID immediately
+    task_id = str(uuid.uuid4())
     
-    try:
-        # Save uploaded file to temporary location
-        with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension, dir=config.temp_dir) as temp_file:
-            content = await file.read()
-            temp_file.write(content)
-            temp_file_path = temp_file.name
-        
-        # Generate task ID
-        task_id = str(uuid.uuid4())
-        
-        # Store task info
-        tasks[task_id] = {
-            "task_id": task_id,
-            "status": "pending",
-            "file_name": file.filename,
-            "file_size": len(content),
-            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "progress": 0.0,
-            "options": {
-                "skip_cross_page_merge": skip_cross_page_merge,
-                "max_page_retries": max_page_retries
-            }
+    # Store minimal task info first (before file processing)
+    tasks[task_id] = {
+        "task_id": task_id,
+        "status": "uploading",
+        "file_name": file.filename,
+        "file_size": file.size or 0,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "progress": 0.0,
+        "options": {
+            "skip_cross_page_merge": skip_cross_page_merge,
+            "max_page_retries": max_page_retries
         }
-        
-        # Start background processing
-        background_tasks.add_task(
-            process_ocr_background,
+    }
+    
+    # Start background processing immediately (including file upload)
+    background_tasks.add_task(
+        process_file_upload_and_ocr,
+        task_id,
+        file,
+        {
+            "skip_cross_page_merge": skip_cross_page_merge,
+            "max_page_retries": max_page_retries
+        }
+    )
+    
+    logger.info(f"Created fast async task {task_id} for file: {file.filename}")
+    
+    # Return immediately to avoid timeout
+    return {
+        "task_id": task_id,
+        "status": "uploading",
+        "message": "Task submitted successfully. File upload and processing will happen in background.",
+        "file_name": file.filename,
+        "estimated_file_size": file.size or 0,
+        "status_url": f"/api/v1/tasks/{task_id}",
+        "result_url": f"/api/v1/tasks/{task_id}/result",
+        "note": "Check status_url for progress updates"
+    }
+
+# Ultra-fast async endpoint for Cloudflare Tunnel
+@app.post("/api/v1/parse-fast", tags=["OCR Processing"])
+async def parse_file_ultra_fast(
+    file: UploadFile = File(..., description="PDF or image file to process"),
+    skip_cross_page_merge: bool = Form(False, description="Skip cross-page merging"),
+    max_page_retries: int = Form(1, description="Maximum retry attempts per page")
+):
+    """
+    Ultra-fast async file submission (Cloudflare Tunnel optimized)
+    
+    This endpoint responds in milliseconds by deferring ALL processing to background.
+    Perfect for avoiding proxy timeouts.
+    """
+    import uuid
+    
+    # Minimal validation
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No filename provided")
+    
+    file_extension = Path(file.filename).suffix.lower()
+    if file_extension not in {'.pdf', '.png', '.jpg', '.jpeg'}:
+        raise HTTPException(status_code=400, detail=f"Unsupported file type: {file_extension}")
+    
+    # Generate task ID
+    task_id = str(uuid.uuid4())
+    
+    # Store minimal task info
+    tasks[task_id] = {
+        "task_id": task_id,
+        "status": "queued",
+        "file_name": file.filename,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "progress": 0.0,
+        "options": {
+            "skip_cross_page_merge": skip_cross_page_merge,
+            "max_page_retries": max_page_retries
+        }
+    }
+    
+    # Schedule processing (don't wait)
+    asyncio.create_task(
+        process_file_upload_and_ocr(
             task_id,
-            temp_file_path,
-            file.filename,
-            len(content),
+            file,
             {
                 "skip_cross_page_merge": skip_cross_page_merge,
                 "max_page_retries": max_page_retries
             }
         )
-        
-        logger.info(f"Created async task {task_id} for file: {file.filename} ({len(content)} bytes)")
-        
-        return {
-            "task_id": task_id,
-            "status": "pending",
-            "message": "Task submitted successfully for background processing",
-            "file_name": file.filename,
-            "file_size": len(content),
-            "status_url": f"/api/v1/tasks/{task_id}",
-            "result_url": f"/api/v1/tasks/{task_id}/result",
-            "estimated_time": "Processing time varies based on file size and complexity"
-        }
-        
-    except Exception as e:
-        logger.error(f"Failed to submit async task for {file.filename}: {e}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to submit file for processing: {str(e)}"
-        )
+    )
+    
+    logger.info(f"Ultra-fast task created: {task_id} for {file.filename}")
+    
+    # Return immediately
+    return {
+        "task_id": task_id,
+        "status": "queued",
+        "message": "Task queued for processing",
+        "status_url": f"/api/v1/tasks/{task_id}",
+        "result_url": f"/api/v1/tasks/{task_id}/result"
+    }
 
 # Batch processing endpoint
 @app.post("/api/v1/batch", tags=["OCR Processing"])
