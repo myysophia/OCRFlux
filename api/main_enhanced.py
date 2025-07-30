@@ -51,66 +51,8 @@ config = SimpleConfig()
 # Simple task storage (in-memory for demo)
 tasks = {}
 
-# Fast background processing function (includes file upload)
-async def process_file_upload_and_ocr(task_id: str, file: UploadFile, options: dict):
-    """Background function that handles both file upload and OCR processing"""
-    file_path = None
-    try:
-        # Update task status
-        tasks[task_id]["status"] = "uploading"
-        tasks[task_id]["progress"] = 0.05
-        tasks[task_id]["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        
-        logger.info(f"Starting file upload for task {task_id}: {file.filename}")
-        
-        # Read file content first (before it gets closed)
-        try:
-            content = await file.read()
-            actual_file_size = len(content)
-            
-            # Check file size limit
-            if actual_file_size > config.max_file_size:
-                raise Exception(f"File size {actual_file_size} bytes exceeds maximum limit of {config.max_file_size} bytes")
-            
-        except Exception as e:
-            if "closed file" in str(e):
-                raise Exception("File was closed before reading. This may be due to proxy timeout.")
-            else:
-                raise e
-        
-        # Save content to temporary file
-        file_extension = Path(file.filename).suffix.lower()
-        with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension, dir=config.temp_dir) as temp_file:
-            temp_file.write(content)
-            file_path = temp_file.name
-        
-        # Update task with actual file size
-        tasks[task_id]["file_size"] = actual_file_size
-        tasks[task_id]["status"] = "processing"
-        tasks[task_id]["progress"] = 0.1
-        tasks[task_id]["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        
-        logger.info(f"File uploaded for task {task_id}: {file.filename} ({actual_file_size} bytes)")
-        
-        # Now do OCR processing
-        await process_ocr_background(task_id, file_path, file.filename, actual_file_size, options)
-        
-    except Exception as e:
-        logger.error(f"File upload/processing failed for task {task_id}: {e}")
-        
-        # Update task with error
-        tasks[task_id]["status"] = "failed"
-        tasks[task_id]["progress"] = 1.0
-        tasks[task_id]["error_message"] = str(e)
-        tasks[task_id]["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        tasks[task_id]["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        
-        # Clean up file if it was created
-        if file_path and os.path.exists(file_path):
-            try:
-                os.unlink(file_path)
-            except:
-                pass
+# Removed problematic process_file_upload_and_ocr function
+# All file reading now happens in the main thread before background processing
 
 # Background OCR processing function
 async def process_ocr_background(task_id: str, file_path: str, file_name: str, file_size: int, options: dict):
@@ -560,16 +502,49 @@ async def parse_file_async(
         }
     }
     
-    # Start background processing immediately (including file upload)
-    background_tasks.add_task(
-        process_file_upload_and_ocr,
-        task_id,
-        file,
-        {
-            "skip_cross_page_merge": skip_cross_page_merge,
-            "max_page_retries": max_page_retries
-        }
-    )
+    try:
+        # Read file content immediately (while connection is still open)
+        content = await file.read()
+        file_size = len(content)
+        
+        # Check file size
+        if file_size > config.max_file_size:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File size {file_size} bytes exceeds maximum limit of {config.max_file_size} bytes"
+            )
+        
+        # Save file to temp location immediately
+        file_extension = Path(file.filename).suffix.lower()
+        with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension, dir=config.temp_dir) as temp_file:
+            temp_file.write(content)
+            temp_file_path = temp_file.name
+        
+        # Update task with actual file size
+        tasks[task_id]["file_size"] = file_size
+        tasks[task_id]["status"] = "queued"
+        tasks[task_id]["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        
+        # Start background OCR processing (file already saved)
+        background_tasks.add_task(
+            process_ocr_background,
+            task_id,
+            temp_file_path,
+            file.filename,
+            file_size,
+            {
+                "skip_cross_page_merge": skip_cross_page_merge,
+                "max_page_retries": max_page_retries
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"Failed to upload file for task {task_id}: {e}")
+        # Update task with error
+        tasks[task_id]["status"] = "failed"
+        tasks[task_id]["error_message"] = f"File upload failed: {str(e)}"
+        tasks[task_id]["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        raise HTTPException(status_code=500, detail=f"Failed to upload file: {str(e)}")
     
     logger.info(f"Created fast async task {task_id} for file: {file.filename}")
     
@@ -836,6 +811,30 @@ async def list_tasks():
         "total_tasks": len(task_list),
         "tasks": task_list[:20]  # Return last 20 tasks
     }
+
+# Simple test endpoint for file upload
+@app.post("/api/v1/test-upload", tags=["Testing"])
+async def test_file_upload(
+    file: UploadFile = File(..., description="Test file upload")
+):
+    """Simple test endpoint to verify file upload works"""
+    try:
+        content = await file.read()
+        file_size = len(content)
+        
+        return {
+            "success": True,
+            "file_name": file.filename,
+            "file_size": file_size,
+            "file_type": file.content_type,
+            "message": "File upload test successful"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "message": "File upload test failed"
+        }
 
 if __name__ == "__main__":
     import uvicorn
