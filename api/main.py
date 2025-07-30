@@ -9,7 +9,7 @@ import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -103,14 +103,98 @@ async def root():
         "health": "/api/v1/health"
     }
 
-# Simple file upload endpoint (placeholder)
+# File upload and OCR processing endpoint
 @app.post("/api/v1/parse")
-async def parse_file():
-    """Parse file endpoint (placeholder)"""
-    return {
-        "message": "OCR parsing endpoint - implementation in progress",
-        "status": "placeholder"
-    }
+async def parse_file(
+    file: UploadFile = File(...),
+    skip_cross_page_merge: bool = Form(False),
+    max_page_retries: int = Form(1)
+):
+    """
+    Parse a single file (PDF or image) and convert to Markdown
+    
+    - **file**: PDF or image file to process
+    - **skip_cross_page_merge**: Skip cross-page merging (default: False)
+    - **max_page_retries**: Maximum retry attempts per page (default: 1)
+    """
+    import time
+    import tempfile
+    import os
+    from pathlib import Path
+    
+    # Validate file type
+    allowed_extensions = {'.pdf', '.png', '.jpg', '.jpeg'}
+    file_extension = Path(file.filename).suffix.lower()
+    
+    if file_extension not in allowed_extensions:
+        raise HTTPException(
+            status_code=400,
+            detail=f"File type {file_extension} not supported. Allowed types: {', '.join(allowed_extensions)}"
+        )
+    
+    # Check file size (200MB limit)
+    if file.size and file.size > config.max_file_size:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File size {file.size} bytes exceeds maximum limit of {config.max_file_size} bytes"
+        )
+    
+    start_time = time.time()
+    temp_file_path = None
+    
+    try:
+        # Save uploaded file to temporary location
+        with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension, dir=config.temp_dir) as temp_file:
+            content = await file.read()
+            temp_file.write(content)
+            temp_file_path = temp_file.name
+        
+        logger.info(f"Processing file: {file.filename} ({len(content)} bytes)")
+        
+        # For now, return a mock response
+        # TODO: Integrate with actual OCRFlux processing
+        processing_time = time.time() - start_time
+        
+        # Mock OCR result
+        mock_result = {
+            "success": True,
+            "file_name": file.filename,
+            "file_path": temp_file_path,
+            "num_pages": 1,
+            "document_text": f"# Mock OCR Result\n\nThis is a mock OCR result for file: {file.filename}\n\nProcessing options:\n- Skip cross-page merge: {skip_cross_page_merge}\n- Max page retries: {max_page_retries}\n\nActual OCR processing will be implemented next.",
+            "page_texts": {
+                "0": f"Mock content for {file.filename}"
+            },
+            "fallback_pages": [],
+            "processing_time": processing_time,
+            "error_message": None
+        }
+        
+        return mock_result
+        
+    except Exception as e:
+        processing_time = time.time() - start_time
+        logger.error(f"Error processing file {file.filename}: {str(e)}")
+        
+        return {
+            "success": False,
+            "file_name": file.filename,
+            "file_path": temp_file_path or "",
+            "num_pages": 0,
+            "document_text": "",
+            "page_texts": {},
+            "fallback_pages": [],
+            "processing_time": processing_time,
+            "error_message": str(e)
+        }
+    
+    finally:
+        # Clean up temporary file
+        if temp_file_path and os.path.exists(temp_file_path):
+            try:
+                os.unlink(temp_file_path)
+            except Exception as e:
+                logger.warning(f"Failed to clean up temp file {temp_file_path}: {e}")
 
 if __name__ == "__main__":
     import uvicorn
