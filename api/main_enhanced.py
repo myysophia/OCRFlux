@@ -34,7 +34,7 @@ class SimpleConfig:
         self.host = os.getenv("HOST", "0.0.0.0")
         self.port = int(os.getenv("PORT", 8000))
         self.debug = os.getenv("DEBUG", "false").lower() == "true"
-        self.log_level = os.getenv("LOG_LEVEL", "INFO")
+        self.log_level = os.getenv("LOG_LEVEL", "DEBUG")
         self.gpu_memory_utilization = float(os.getenv("GPU_MEMORY_UTILIZATION", 0.9))
         self.max_concurrent_tasks = int(os.getenv("MAX_CONCURRENT_TASKS", 8))
         self.max_file_size = int(os.getenv("MAX_FILE_SIZE", 209715200))
@@ -58,8 +58,25 @@ async def lifespan(app: FastAPI):
     
     # Startup
     try:
-        # TODO: Initialize model manager
-        logger.info("Model manager initialization (placeholder)")
+        # Initialize model state
+        app.state.model = None
+        
+        # Optionally preload model (uncomment if you want to preload)
+        # logger.info("Preloading OCRFlux model...")
+        # try:
+        #     from vllm import LLM
+        #     app.state.model = LLM(
+        #         model=config.model_path,
+        #         gpu_memory_utilization=config.gpu_memory_utilization,
+        #         trust_remote_code=True,
+        #         enforce_eager=False,
+        #         disable_log_stats=True,
+        #     )
+        #     logger.info("Model preloaded successfully")
+        # except Exception as e:
+        #     logger.warning(f"Model preload failed: {e}")
+        
+        logger.info("OCRFlux API Service ready (model will load on first request)")
         yield
     except Exception as e:
         logger.error(f"Failed to initialize service: {e}")
@@ -151,7 +168,8 @@ async def health_check_detailed():
         "model": {
             "path": config.model_path,
             "exists": os.path.exists(config.model_path),
-            "loaded": False  # TODO: Check actual model status
+            "loaded": hasattr(app.state, 'model') and app.state.model is not None,
+            "gpu_memory_utilization": config.gpu_memory_utilization
         },
         "system": {
             "cpu_percent": psutil.cpu_percent(),
@@ -219,24 +237,80 @@ async def parse_file(
         
         logger.info(f"Processing file: {file.filename} ({len(content)} bytes)")
         
-        # TODO: Integrate with actual OCRFlux processing
-        processing_time = time.time() - start_time
-        
-        # Mock OCR result with more realistic content
-        mock_result = {
-            "success": True,
-            "file_name": file.filename,
-            "file_path": temp_file_path,
-            "file_size": len(content),
-            "num_pages": 1,
-            "document_text": f"# OCR Result for {file.filename}\n\nThis is a mock OCR result. The actual OCR processing will be implemented using OCRFlux.\n\n## Processing Options\n- Skip cross-page merge: {skip_cross_page_merge}\n- Max page retries: {max_page_retries}\n\n## File Information\n- File size: {len(content)} bytes\n- File type: {file_extension}\n- Processing time: {processing_time:.2f} seconds",
-            "page_texts": {
-                "0": f"Mock content for {file.filename}"
-            },
-            "fallback_pages": [],
-            "processing_time": processing_time,
-            "error_message": None
-        }
+        # Real OCRFlux processing
+        try:
+            # Import OCRFlux
+            from ocrflux.inference import parse as ocrflux_parse
+            from vllm import LLM
+            
+            # Load model if not already loaded
+            if not hasattr(app.state, 'model') or app.state.model is None:
+                logger.info("Loading OCRFlux model...")
+                app.state.model = LLM(
+                    model=config.model_path,
+                    gpu_memory_utilization=config.gpu_memory_utilization,
+                    trust_remote_code=True,
+                    enforce_eager=False,
+                    disable_log_stats=True,
+                )
+                logger.info("Model loaded successfully")
+            
+            # Process with OCRFlux
+            logger.info(f"Starting OCRFlux processing for: {file.filename}")
+            ocr_result = ocrflux_parse(
+                llm=app.state.model,
+                file_path=temp_file_path,
+                skip_cross_page_merge=skip_cross_page_merge,
+                max_page_retries=max_page_retries
+            )
+            
+            processing_time = time.time() - start_time
+            
+            if ocr_result:
+                # Extract results from OCRFlux
+                document_text = ocr_result.get("document_text", "")
+                page_texts = ocr_result.get("page_texts", {})
+                fallback_pages = ocr_result.get("fallback_pages", [])
+                
+                # Count pages
+                num_pages = len(page_texts) if page_texts else 1
+                
+                real_result = {
+                    "success": True,
+                    "file_name": file.filename,
+                    "file_path": temp_file_path,
+                    "file_size": len(content),
+                    "num_pages": num_pages,
+                    "document_text": document_text,
+                    "page_texts": page_texts,
+                    "fallback_pages": fallback_pages,
+                    "processing_time": processing_time,
+                    "error_message": None
+                }
+                
+                logger.info(f"OCRFlux processing completed: {file.filename}, pages: {num_pages}, time: {processing_time:.2f}s")
+                return real_result
+            else:
+                raise Exception("OCRFlux returned empty result")
+                
+        except Exception as ocr_error:
+            logger.error(f"OCRFlux processing failed: {ocr_error}")
+            processing_time = time.time() - start_time
+            
+            # Return error result
+            error_result = {
+                "success": False,
+                "file_name": file.filename,
+                "file_path": temp_file_path,
+                "file_size": len(content),
+                "num_pages": 0,
+                "document_text": "",
+                "page_texts": {},
+                "fallback_pages": [],
+                "processing_time": processing_time,
+                "error_message": f"OCR processing failed: {str(ocr_error)}"
+            }
+            return error_result
         
         return mock_result
         
