@@ -63,19 +63,28 @@ async def process_file_upload_and_ocr(task_id: str, file: UploadFile, options: d
         
         logger.info(f"Starting file upload for task {task_id}: {file.filename}")
         
-        # Check file size limit
-        if file.size and file.size > config.max_file_size:
-            raise Exception(f"File size {file.size} bytes exceeds maximum limit of {config.max_file_size} bytes")
+        # Read file content first (before it gets closed)
+        try:
+            content = await file.read()
+            actual_file_size = len(content)
+            
+            # Check file size limit
+            if actual_file_size > config.max_file_size:
+                raise Exception(f"File size {actual_file_size} bytes exceeds maximum limit of {config.max_file_size} bytes")
+            
+        except Exception as e:
+            if "closed file" in str(e):
+                raise Exception("File was closed before reading. This may be due to proxy timeout.")
+            else:
+                raise e
         
-        # Save uploaded file to temporary location
+        # Save content to temporary file
         file_extension = Path(file.filename).suffix.lower()
         with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension, dir=config.temp_dir) as temp_file:
-            content = await file.read()
             temp_file.write(content)
             file_path = temp_file.name
         
         # Update task with actual file size
-        actual_file_size = len(content)
         tasks[task_id]["file_size"] = actual_file_size
         tasks[task_id]["status"] = "processing"
         tasks[task_id]["progress"] = 0.1
@@ -94,6 +103,7 @@ async def process_file_upload_and_ocr(task_id: str, file: UploadFile, options: d
         tasks[task_id]["progress"] = 1.0
         tasks[task_id]["error_message"] = str(e)
         tasks[task_id]["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        tasks[task_id]["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         
         # Clean up file if it was created
         if file_path and os.path.exists(file_path):
@@ -585,7 +595,7 @@ async def parse_file_ultra_fast(
     """
     Ultra-fast async file submission (Cloudflare Tunnel optimized)
     
-    This endpoint responds in milliseconds by deferring ALL processing to background.
+    This endpoint reads the file quickly and then processes in background.
     Perfect for avoiding proxy timeouts.
     """
     import uuid
@@ -598,44 +608,74 @@ async def parse_file_ultra_fast(
     if file_extension not in {'.pdf', '.png', '.jpg', '.jpeg'}:
         raise HTTPException(status_code=400, detail=f"Unsupported file type: {file_extension}")
     
-    # Generate task ID
-    task_id = str(uuid.uuid4())
-    
-    # Store minimal task info
-    tasks[task_id] = {
-        "task_id": task_id,
-        "status": "queued",
-        "file_name": file.filename,
-        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "progress": 0.0,
-        "options": {
-            "skip_cross_page_merge": skip_cross_page_merge,
-            "max_page_retries": max_page_retries
-        }
-    }
-    
-    # Schedule processing (don't wait)
-    asyncio.create_task(
-        process_file_upload_and_ocr(
-            task_id,
-            file,
-            {
+    try:
+        # Read file content immediately (while connection is still open)
+        content = await file.read()
+        file_size = len(content)
+        
+        # Check file size
+        if file_size > config.max_file_size:
+            raise HTTPException(
+                status_code=413,
+                detail=f"File size {file_size} bytes exceeds maximum limit of {config.max_file_size} bytes"
+            )
+        
+        # Generate task ID
+        task_id = str(uuid.uuid4())
+        
+        # Save file to temp location immediately
+        with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension, dir=config.temp_dir) as temp_file:
+            temp_file.write(content)
+            temp_file_path = temp_file.name
+        
+        # Store task info
+        tasks[task_id] = {
+            "task_id": task_id,
+            "status": "queued",
+            "file_name": file.filename,
+            "file_size": file_size,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "progress": 0.0,
+            "options": {
                 "skip_cross_page_merge": skip_cross_page_merge,
                 "max_page_retries": max_page_retries
             }
+        }
+        
+        # Schedule OCR processing (file already saved)
+        asyncio.create_task(
+            process_ocr_background(
+                task_id,
+                temp_file_path,
+                file.filename,
+                file_size,
+                {
+                    "skip_cross_page_merge": skip_cross_page_merge,
+                    "max_page_retries": max_page_retries
+                }
+            )
         )
-    )
-    
-    logger.info(f"Ultra-fast task created: {task_id} for {file.filename}")
-    
-    # Return immediately
-    return {
-        "task_id": task_id,
-        "status": "queued",
-        "message": "Task queued for processing",
-        "status_url": f"/api/v1/tasks/{task_id}",
-        "result_url": f"/api/v1/tasks/{task_id}/result"
-    }
+        
+        logger.info(f"Ultra-fast task created: {task_id} for {file.filename} ({file_size} bytes)")
+        
+        # Return immediately
+        return {
+            "task_id": task_id,
+            "status": "queued",
+            "message": "File uploaded successfully, OCR processing queued",
+            "file_name": file.filename,
+            "file_size": file_size,
+            "status_url": f"/api/v1/tasks/{task_id}",
+            "result_url": f"/api/v1/tasks/{task_id}/result"
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to process file upload: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to upload file: {str(e)}"
+        )
 
 # Batch processing endpoint
 @app.post("/api/v1/batch", tags=["OCR Processing"])
@@ -767,6 +807,35 @@ async def get_task_result(task_id: str):
         raise HTTPException(status_code=500, detail="Task completed but result not found")
     
     return task["result"]
+
+# List all tasks endpoint
+@app.get("/api/v1/tasks", tags=["Task Management"])
+async def list_tasks():
+    """List all tasks (for debugging and monitoring)"""
+    task_list = []
+    for task_id, task in tasks.items():
+        task_summary = {
+            "task_id": task_id,
+            "status": task["status"],
+            "file_name": task["file_name"],
+            "file_size": task.get("file_size", 0),
+            "progress": task["progress"],
+            "created_at": task["created_at"],
+            "updated_at": task.get("updated_at", task["created_at"])
+        }
+        if "completed_at" in task:
+            task_summary["completed_at"] = task["completed_at"]
+        if "error_message" in task:
+            task_summary["error_message"] = task["error_message"]
+        task_list.append(task_summary)
+    
+    # Sort by creation time (newest first)
+    task_list.sort(key=lambda x: x["created_at"], reverse=True)
+    
+    return {
+        "total_tasks": len(task_list),
+        "tasks": task_list[:20]  # Return last 20 tasks
+    }
 
 if __name__ == "__main__":
     import uvicorn
