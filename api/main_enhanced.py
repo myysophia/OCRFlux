@@ -8,11 +8,13 @@ import os
 import sys
 import time
 import tempfile
+import asyncio
+import threading
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import List
 
-from fastapi import FastAPI, HTTPException, File, UploadFile, Form
+from fastapi import FastAPI, HTTPException, File, UploadFile, Form, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -48,6 +50,118 @@ config = SimpleConfig()
 
 # Simple task storage (in-memory for demo)
 tasks = {}
+
+# Background OCR processing function
+async def process_ocr_background(task_id: str, file_path: str, file_name: str, file_size: int, options: dict):
+    """Background OCR processing function"""
+    try:
+        # Update task status to processing
+        tasks[task_id]["status"] = "processing"
+        tasks[task_id]["progress"] = 0.1
+        tasks[task_id]["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        
+        logger.info(f"Starting background OCR processing for task {task_id}: {file_name}")
+        
+        start_time = time.time()
+        
+        # Import OCRFlux
+        from ocrflux.inference import parse as ocrflux_parse
+        from vllm import LLM
+        
+        # Load model if not already loaded
+        if not hasattr(app.state, 'model') or app.state.model is None:
+            logger.info(f"Loading OCRFlux model for task {task_id}...")
+            tasks[task_id]["progress"] = 0.2
+            app.state.model = LLM(
+                model=config.model_path,
+                gpu_memory_utilization=config.gpu_memory_utilization,
+                trust_remote_code=True,
+                enforce_eager=False,
+                disable_log_stats=True,
+            )
+            logger.info("Model loaded successfully")
+        
+        # Update progress
+        tasks[task_id]["progress"] = 0.3
+        tasks[task_id]["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        
+        # Process with OCRFlux
+        logger.info(f"Starting OCRFlux processing for task {task_id}: {file_name}")
+        tasks[task_id]["progress"] = 0.5
+        
+        ocr_result = ocrflux_parse(
+            llm=app.state.model,
+            file_path=file_path,
+            skip_cross_page_merge=options.get("skip_cross_page_merge", False),
+            max_page_retries=options.get("max_page_retries", 1)
+        )
+        
+        processing_time = time.time() - start_time
+        
+        if ocr_result:
+            # Extract results from OCRFlux
+            document_text = ocr_result.get("document_text", "")
+            page_texts = ocr_result.get("page_texts", {})
+            fallback_pages = ocr_result.get("fallback_pages", [])
+            num_pages = len(page_texts) if page_texts else 1
+            
+            # Store successful result
+            result = {
+                "success": True,
+                "file_name": file_name,
+                "file_size": file_size,
+                "num_pages": num_pages,
+                "document_text": document_text,
+                "page_texts": page_texts,
+                "fallback_pages": fallback_pages,
+                "processing_time": processing_time,
+                "error_message": None
+            }
+            
+            # Update task with result
+            tasks[task_id]["status"] = "completed"
+            tasks[task_id]["progress"] = 1.0
+            tasks[task_id]["result"] = result
+            tasks[task_id]["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            tasks[task_id]["processing_time"] = processing_time
+            
+            logger.info(f"Background OCR processing completed for task {task_id}: {file_name}, pages: {num_pages}, time: {processing_time:.2f}s")
+            
+        else:
+            raise Exception("OCRFlux returned empty result")
+            
+    except Exception as e:
+        logger.error(f"Background OCR processing failed for task {task_id}: {e}")
+        processing_time = time.time() - start_time if 'start_time' in locals() else 0
+        
+        # Store error result
+        error_result = {
+            "success": False,
+            "file_name": file_name,
+            "file_size": file_size,
+            "num_pages": 0,
+            "document_text": "",
+            "page_texts": {},
+            "fallback_pages": [],
+            "processing_time": processing_time,
+            "error_message": f"OCR processing failed: {str(e)}"
+        }
+        
+        # Update task with error
+        tasks[task_id]["status"] = "failed"
+        tasks[task_id]["progress"] = 1.0
+        tasks[task_id]["result"] = error_result
+        tasks[task_id]["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        tasks[task_id]["error_message"] = str(e)
+        
+    finally:
+        # Clean up temporary file
+        try:
+            if os.path.exists(file_path):
+                os.unlink(file_path)
+                logger.debug(f"Cleaned up temp file for task {task_id}: {file_path}")
+        except Exception as e:
+            logger.warning(f"Failed to cleanup temp file for task {task_id}: {e}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -342,12 +456,16 @@ async def parse_file(
 # Async single file processing
 @app.post("/api/v1/parse-async", tags=["OCR Processing"])
 async def parse_file_async(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(..., description="PDF or image file to process"),
     skip_cross_page_merge: bool = Form(False, description="Skip cross-page merging"),
     max_page_retries: int = Form(1, description="Maximum retry attempts per page")
 ):
     """
     Submit a single file for asynchronous OCR processing
+    
+    This endpoint immediately returns a task ID and processes the file in the background.
+    Use this for large files or when you want to avoid timeout issues with proxies like Cloudflare.
     
     Returns a task ID that can be used to check processing status and retrieve results.
     """
@@ -363,31 +481,70 @@ async def parse_file_async(
             detail=f"File type {file_extension} not supported. Allowed types: {', '.join(allowed_extensions)}"
         )
     
-    # Generate task ID
-    task_id = str(uuid.uuid4())
+    # Check file size
+    if file.size and file.size > config.max_file_size:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File size {file.size} bytes exceeds maximum limit of {config.max_file_size} bytes"
+        )
     
-    # Store task info
-    tasks[task_id] = {
-        "task_id": task_id,
-        "status": "pending",
-        "file_name": file.filename,
-        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "progress": 0.0,
-        "options": {
-            "skip_cross_page_merge": skip_cross_page_merge,
-            "max_page_retries": max_page_retries
+    try:
+        # Save uploaded file to temporary location
+        with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension, dir=config.temp_dir) as temp_file:
+            content = await file.read()
+            temp_file.write(content)
+            temp_file_path = temp_file.name
+        
+        # Generate task ID
+        task_id = str(uuid.uuid4())
+        
+        # Store task info
+        tasks[task_id] = {
+            "task_id": task_id,
+            "status": "pending",
+            "file_name": file.filename,
+            "file_size": len(content),
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "progress": 0.0,
+            "options": {
+                "skip_cross_page_merge": skip_cross_page_merge,
+                "max_page_retries": max_page_retries
+            }
         }
-    }
-    
-    logger.info(f"Created async task {task_id} for file: {file.filename}")
-    
-    return {
-        "task_id": task_id,
-        "status": "pending",
-        "message": "Task submitted successfully",
-        "status_url": f"/api/v1/tasks/{task_id}",
-        "result_url": f"/api/v1/tasks/{task_id}/result"
-    }
+        
+        # Start background processing
+        background_tasks.add_task(
+            process_ocr_background,
+            task_id,
+            temp_file_path,
+            file.filename,
+            len(content),
+            {
+                "skip_cross_page_merge": skip_cross_page_merge,
+                "max_page_retries": max_page_retries
+            }
+        )
+        
+        logger.info(f"Created async task {task_id} for file: {file.filename} ({len(content)} bytes)")
+        
+        return {
+            "task_id": task_id,
+            "status": "pending",
+            "message": "Task submitted successfully for background processing",
+            "file_name": file.filename,
+            "file_size": len(content),
+            "status_url": f"/api/v1/tasks/{task_id}",
+            "result_url": f"/api/v1/tasks/{task_id}/result",
+            "estimated_time": "Processing time varies based on file size and complexity"
+        }
+        
+    except Exception as e:
+        logger.error(f"Failed to submit async task for {file.filename}: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to submit file for processing: {str(e)}"
+        )
 
 # Batch processing endpoint
 @app.post("/api/v1/batch", tags=["OCR Processing"])
@@ -473,17 +630,28 @@ async def get_task_status(task_id: str):
     
     task = tasks[task_id]
     
-    # Simulate task progress
-    if task["status"] == "pending":
-        task["status"] = "processing"
-        task["progress"] = 0.5
-        task["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    elif task["status"] == "processing":
-        task["status"] = "completed"
-        task["progress"] = 1.0
-        task["completed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    # Return current task status (no simulation, real status)
+    response = {
+        "task_id": task["task_id"],
+        "status": task["status"],
+        "progress": task["progress"],
+        "file_name": task["file_name"],
+        "file_size": task.get("file_size", 0),
+        "created_at": task["created_at"],
+        "updated_at": task.get("updated_at", task["created_at"])
+    }
     
-    return task
+    # Add completion info if available
+    if "completed_at" in task:
+        response["completed_at"] = task["completed_at"]
+    
+    if "processing_time" in task:
+        response["processing_time"] = task["processing_time"]
+    
+    if "error_message" in task:
+        response["error_message"] = task["error_message"]
+    
+    return response
 
 # Task result endpoint
 @app.get("/api/v1/tasks/{task_id}/result", tags=["Task Management"])
@@ -494,21 +662,20 @@ async def get_task_result(task_id: str):
     
     task = tasks[task_id]
     
-    if task["status"] != "completed":
-        raise HTTPException(status_code=400, detail="Task not completed yet")
+    if task["status"] == "pending":
+        raise HTTPException(status_code=202, detail="Task is still pending")
+    elif task["status"] == "processing":
+        raise HTTPException(status_code=202, detail=f"Task is still processing (progress: {task['progress']*100:.1f}%)")
+    elif task["status"] == "failed":
+        raise HTTPException(status_code=500, detail=f"Task failed: {task.get('error_message', 'Unknown error')}")
+    elif task["status"] != "completed":
+        raise HTTPException(status_code=400, detail=f"Task status is {task['status']}")
     
-    # Mock result
-    return {
-        "success": True,
-        "file_name": task["file_name"],
-        "file_size": 1024,
-        "num_pages": 1,
-        "document_text": f"# Async OCR Result for {task['file_name']}\n\nThis is a mock async OCR result.",
-        "page_texts": {"0": f"Mock async content for {task['file_name']}"},
-        "fallback_pages": [],
-        "processing_time": 2.5,
-        "error_message": None
-    }
+    # Return real OCR result
+    if "result" not in task:
+        raise HTTPException(status_code=500, detail="Task completed but result not found")
+    
+    return task["result"]
 
 if __name__ == "__main__":
     import uvicorn
